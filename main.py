@@ -1,79 +1,78 @@
 import cv2
 import numpy as np
 
-def detect_graffiti_traditional(image_path):
-    # 1. Görüntüyü Oku
+def auto_canny(gray, sigma=0.33):
+    v = np.median(gray)
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    return cv2.Canny(gray, lower, upper)
+
+def find_contours_compat(bin_img):
+    res = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return res[0] if len(res) == 2 else res[1]
+
+def detect_graffiti_traditional_v2(image_path, show=True):
     img = cv2.imread(image_path)
     if img is None:
         print("Hata: Görüntü yüklenemedi. Dosya yolunu kontrol edin.")
         return
 
-    # Orijinal görüntüyü kopyala (sonuçları bunun üzerine çizeceğiz)
-    output_img = img.copy()
+    h, w = img.shape[:2]
+    output = img.copy()
 
-    # 2. Gürültü Azaltma (Blur)
-    # Tuğla desenlerini yumuşatmak için güçlü bir bulanıklaştırma kullanıyoruz.
-    # (21, 21) kernel boyutu resmin çözünürlüğüne göre artırılabilir/azaltılabilir.
-    blurred = cv2.GaussianBlur(img, (21, 21), 0)
+    # 1) Daha hafif blur (detay öldürmesin)
+    blurred = cv2.GaussianBlur(img, (5, 5), 0)
 
-    # 3. Renk Uzayı Dönüşümü (BGR -> HSV)
+    # 2) HSV -> Saturation mask (Otsu ile adaptif)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    s_blur = cv2.GaussianBlur(s, (5, 5), 0)
+    _, sat_mask = cv2.threshold(s_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 4. Saturation (Doygunluk) Kanalını Ayırma
-    # H (Renk özü), S (Doygunluk), V (Parlaklık). 
-    # Grafitiler genelde duvardan daha 'doygun' renklere sahiptir.
-    h_channel, s_channel, v_channel = cv2.split(hsv)
+    # 3) Edge mask (auto-canny)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    edge_mask = auto_canny(gray, sigma=0.33)
 
-    # 5. Eşikleme (Thresholding)
-    # Doygunluğu belli bir seviyenin (örn: 50) üzerinde olan pikselleri beyaz yap.
-    # Bu değer duvarın rengine göre (50-80 arası) değiştirilebilir.
-    # Düz tuğla duvarlar genelde düşük doygunluktadır.
-    _, mask = cv2.threshold(s_channel, 60, 255, cv2.THRESH_BINARY)
+    # 4) Birleştir
+    combined = cv2.bitwise_or(sat_mask, edge_mask)
 
-    # 6. Morfolojik İşlemler (Çok Önemli Adım)
-    # Maskede oluşan küçük noktaları temizle ve grafiti parçalarını birleştir.
-    kernel = np.ones((15, 15), np.uint8)
-    
-    # Erode + Dilate (Opening): Küçük gürültüleri (tek tük tuğla lekelerini) siler.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    
-    # Dilate + Erode (Closing): Grafiti harflerini birbirine bağlar, delikleri kapatır.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # 5) Morfoloji (dinamik kernel)
+    # Görsel büyükse kernel biraz büyür, küçükse küçülür.
+    k = max(3, (min(h, w) // 250) | 1)   # tek sayı olsun
+    kernel = np.ones((k, k), np.uint8)
 
-    # 7. Kontur Bulma (Sınırları Çizme)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Önce azıcık gürültü temizle (open çok hafif!)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Sonra parçaları birleştir (close)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    found_graffiti = False
-    
-    for contour in contours:
-        # Alan Filtrelemesi:
-        # Çok küçük alanları (hatalı tespitleri) görmezden gel.
-        area = cv2.contourArea(contour)
-        if area > 500:  # Bu değer resim boyutuna göre ayarlanmalı (örn: 1000 - 5000 arası)
-            found_graffiti = True
-            
-            # Dikdörtgen içine al
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Tespit edilen bölgeyi yeşil kutu içine al
-            cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
-            
-            # Üzerine yazı yaz
-            cv2.putText(output_img, "Grafiti", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    # 6) Kontur + alan filtresi (resim boyutuna göre)
+    contours = find_contours_compat(combined)
+    min_area = 0.0015 * (h * w)  # resmin %0.15'i altını ele
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area >= min_area:
+            x, y, ww, hh = cv2.boundingRect(cnt)
+            cv2.rectangle(output, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
+            cv2.putText(output, "Graffiti", (x, max(0, y - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    # 8. Sonuçları Göster
-    # Maske halini de gösteriyorum ki algoritmanın neyi görüp neyi görmediğini anlayın.
-    # Ekran sığması için yeniden boyutlandırma (opsiyonel)
-    img_s = cv2.resize(img, (600, 400))
-    mask_s = cv2.resize(mask, (600, 400))
-    out_s = cv2.resize(output_img, (600, 400))
+    if show:
+        # Ekrana sığması için ölçekle
+        scale = 900 / max(h, w)
+        if scale < 1:
+            img_s = cv2.resize(img, (int(w*scale), int(h*scale)))
+            mask_s = cv2.resize(combined, (int(w*scale), int(h*scale)))
+            out_s = cv2.resize(output, (int(w*scale), int(h*scale)))
+        else:
+            img_s, mask_s, out_s = img, combined, output
 
-    cv2.imshow('1. Orijinal', img_s)
-    cv2.imshow('2. Islenmis Maske (Algoritmanin Gordugu)', mask_s)
-    cv2.imshow('3. Sonuc', out_s)
+        cv2.imshow("1. Orijinal", img_s)
+        cv2.imshow("2. Maske", mask_s)
+        cv2.imshow("3. Sonuc", out_s)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
-    print("İşlem tamamlandı. Çıkmak için bir tuşa basın.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    return output, combined
 
-detect_graffiti_traditional('test-image.png')
+detect_graffiti_traditional_v2("test-image.png")
